@@ -205,3 +205,27 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project-specific: model weights and exports
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.weights
+*.engine
+*.tflite
+*.pb
+*.safetensors
+
+# Project-specific: local media/data artifacts
+input/
+outputs/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Local notebooks and editors
+.ipynb_checkpoints/
+.vscode/
+.idea/
