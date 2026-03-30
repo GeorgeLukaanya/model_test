@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -13,9 +15,13 @@ import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+logger = logging.getLogger(__name__)
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v"}
 SUPPORTED_MODEL_EXTENSIONS = {".onnx", ".pt"}
+
+# Smoothing factor for the velocity exponential moving average (0 = no update, 1 = instant).
+_VELOCITY_ALPHA = 0.5
 
 
 @dataclass
@@ -48,34 +54,58 @@ class Track:
     last_frame: int
     hits: int = 1
     age: int = 0
+    vx: float = 0.0  # centroid velocity x (pixels/frame, EMA-smoothed)
+    vy: float = 0.0  # centroid velocity y
 
     def update(self, bbox: list[int], confidence: float, frame_index: int) -> None:
+        # Update velocity before changing bbox so we measure displacement from the old centre.
+        old_cx = (self.bbox[0] + self.bbox[2]) / 2.0
+        old_cy = (self.bbox[1] + self.bbox[3]) / 2.0
+        new_cx = (bbox[0] + bbox[2]) / 2.0
+        new_cy = (bbox[1] + bbox[3]) / 2.0
+        self.vx = _VELOCITY_ALPHA * (new_cx - old_cx) + (1 - _VELOCITY_ALPHA) * self.vx
+        self.vy = _VELOCITY_ALPHA * (new_cy - old_cy) + (1 - _VELOCITY_ALPHA) * self.vy
         self.bbox = bbox
         self.confidence = confidence
         self.last_frame = frame_index
         self.hits += 1
         self.age = 0
 
+    def predicted_bbox(self) -> list[int]:
+        """Return the expected bbox one frame ahead based on current velocity."""
+        return [
+            int(self.bbox[0] + self.vx),
+            int(self.bbox[1] + self.vy),
+            int(self.bbox[2] + self.vx),
+            int(self.bbox[3] + self.vy),
+        ]
 
-def _combined_score(bbox_a: list[int], bbox_b: list[int], iou_threshold: float, max_dist_px: float) -> float:
+
+def _combined_score(
+    predicted_bbox: list[int],
+    det_bbox: list[int],
+    iou_threshold: float,
+    max_dist_px: float,
+) -> float:
     """Return a match score in (0, 1].
 
-    Returns the IoU when boxes overlap and IoU >= iou_threshold.
-    Falls back to a small proximity score when bees are nearby but not overlapping,
-    so fast-moving bees keep their track ID even between non-overlapping frames.
-    Returns 0 when neither criterion is met (no valid match).
+    Uses IoU against the track's *predicted* next position so that fast-moving
+    bees are matched before they drift out of the last known box.
+    Falls back to a small proximity score (0, 0.05] when IoU is zero but the
+    centroid is within max_dist_px, so bees keep their ID even between
+    non-overlapping frames.
+    Returns 0 when neither criterion is met.
     """
-    iou = bbox_iou(bbox_a, bbox_b)
+    iou = bbox_iou(predicted_bbox, det_bbox)
     if iou >= iou_threshold:
         return iou
 
-    cx_a = (bbox_a[0] + bbox_a[2]) / 2.0
-    cy_a = (bbox_a[1] + bbox_a[3]) / 2.0
-    cx_b = (bbox_b[0] + bbox_b[2]) / 2.0
-    cy_b = (bbox_b[1] + bbox_b[3]) / 2.0
+    cx_a = (predicted_bbox[0] + predicted_bbox[2]) / 2.0
+    cy_a = (predicted_bbox[1] + predicted_bbox[3]) / 2.0
+    cx_b = (det_bbox[0] + det_bbox[2]) / 2.0
+    cy_b = (det_bbox[1] + det_bbox[3]) / 2.0
     dist = ((cx_a - cx_b) ** 2 + (cy_a - cy_b) ** 2) ** 0.5
     if dist < max_dist_px:
-        # Scale to (0, 0.05] so centroid matches are always ranked below any valid IoU match.
         return (1.0 - dist / max_dist_px) * 0.05
     return 0.0
 
@@ -137,15 +167,16 @@ class BeeTracker:
         n_tracks = len(track_ids)
         n_dets = len(detections)
 
-        # Build score matrix [n_tracks × n_dets].
+        # Build score matrix [n_tracks × n_dets] using velocity-predicted positions.
         score_matrix = np.zeros((n_tracks, n_dets), dtype=np.float32)
         for i, tid in enumerate(track_ids):
+            predicted = self.tracks[tid].predicted_bbox()
             for j, det in enumerate(detections):
                 score_matrix[i, j] = _combined_score(
-                    self.tracks[tid].bbox, det.bbox, self.iou_threshold, self.max_dist_px
+                    predicted, det.bbox, self.iou_threshold, self.max_dist_px
                 )
 
-        # Optimal (Hungarian) assignment minimises cost = 1 - score.
+        # Hungarian optimal assignment (minimises cost = 1 − score).
         row_ind, col_ind = linear_sum_assignment(1.0 - score_matrix)
 
         matched_tracks: set[int] = set()
@@ -171,19 +202,29 @@ class BaseDetector:
 
 class OnnxDetector(BaseDetector):
     def __init__(self, model_path: Path) -> None:
-        self.net = cv2.dnn.readNetFromONNX(str(model_path))
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise ImportError(
+                "Using a .onnx model requires onnxruntime. Install it with "
+                "'pip install onnxruntime' (or onnxruntime-gpu for CUDA)."
+            ) from exc
+
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if "CUDAExecutionProvider" in ort.get_available_providers()
+            else ["CPUExecutionProvider"]
+        )
+        logger.info("Loading ONNX model: %s (providers: %s)", model_path, providers)
+        self.session = ort.InferenceSession(str(model_path), providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
 
     def detect(self, frame: np.ndarray, args: argparse.Namespace) -> list[Detection]:
         resized, scale, pad_x, pad_y = letterbox(frame, args.imgsz)
-        blob = cv2.dnn.blobFromImage(
-            resized,
-            scalefactor=1 / 255.0,
-            size=(args.imgsz, args.imgsz),
-            swapRB=True,
-            crop=False,
-        )
-        self.net.setInput(blob)
-        output = self.net.forward(self.net.getUnconnectedOutLayersNames())[0]
+        # BGR → RGB, normalise to [0, 1], layout [1, 3, H, W]
+        blob = resized[:, :, ::-1].astype(np.float32) / 255.0
+        blob = blob.transpose(2, 0, 1)[np.newaxis, ...]
+        output = self.session.run(None, {self.input_name: blob})[0]
         return postprocess_detections(
             output=output,
             frame_shape=frame.shape[:2],
@@ -202,9 +243,10 @@ class PtDetector(BaseDetector):
         except ImportError as exc:
             raise ImportError(
                 "Using a .pt model requires Ultralytics. Install it with "
-                "'.venv/bin/python -m pip install ultralytics'."
+                "'pip install ultralytics'."
             ) from exc
 
+        logger.info("Loading PyTorch model: %s", model_path)
         self.model = YOLO(str(model_path))
 
     def detect(self, frame: np.ndarray, args: argparse.Namespace) -> list[Detection]:
@@ -232,71 +274,50 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run bee detection + tracking on a video and export annotations."
     )
-    parser.add_argument(
-        "--input",
-        required=True,
-        help="Path to the input video.",
-    )
+    parser.add_argument("--input", required=True, help="Path to the input video.")
     parser.add_argument(
         "--model",
         default="best.onnx",
-        help="Path to the trained model. Supports .onnx and .pt. Defaults to best.onnx.",
+        help="Path to the trained model (.onnx or .pt).",
     )
     parser.add_argument(
         "--output-dir",
         default="outputs",
-        help="Directory where the annotated video and summary files will be saved.",
+        help="Directory for the annotated video and summary files.",
     )
-    parser.add_argument(
-        "--conf",
-        type=float,
-        default=0.25,
-        help="Detection confidence threshold.",
-    )
-    parser.add_argument(
-        "--nms-iou",
-        type=float,
-        default=0.45,
-        help="IoU threshold used during non-maximum suppression.",
-    )
-    parser.add_argument(
-        "--imgsz",
-        type=int,
-        default=640,
-        help="Inference image size.",
-    )
+    parser.add_argument("--conf", type=float, default=0.25, help="Detection confidence threshold.")
+    parser.add_argument("--nms-iou", type=float, default=0.45, help="NMS IoU threshold.")
+    parser.add_argument("--imgsz", type=int, default=640, help="Inference image size.")
     parser.add_argument(
         "--track-iou",
         type=float,
-        default=0.3,
-        help="Minimum IoU required to keep a detection on the same track ID.",
+        default=0.1,
+        help="Minimum IoU to keep a detection on the same track ID.",
     )
     parser.add_argument(
         "--max-track-age",
         type=int,
         default=20,
-        help="How many consecutive frames a missing track is kept alive.",
+        help="Consecutive frames a missing track is kept alive.",
     )
     parser.add_argument(
         "--min-track-frames",
         type=int,
         default=3,
-        help="Minimum number of frames a track must survive before it counts toward unique bees.",
+        help="Frames a track must survive before counting toward unique bees.",
     )
-    parser.add_argument(
-        "--line-thickness",
-        type=int,
-        default=2,
-        help="Bounding box line thickness for annotations.",
-    )
+    parser.add_argument("--line-thickness", type=int, default=2, help="Bounding box line thickness.")
     parser.add_argument(
         "--max-dist-px",
         type=float,
         default=150.0,
-        help=(
-            "Maximum centroid-to-centroid distance (pixels) for falling back to "
-            "distance-based matching when IoU is zero. Helps track fast-moving bees."
-        ),
+        help="Max centroid distance (px) for fallback distance-based matching.",
+    )
+    parser.add_argument(
+        "--full-frame-log",
+        action="store_true",
+        default=False,
+        help="Write one JSON record per frame instead of per-second aggregates.",
     )
     return parser.parse_args()
 
@@ -313,6 +334,7 @@ def build_args(
     min_track_frames: int = 3,
     line_thickness: int = 2,
     max_dist_px: float = 150.0,
+    full_frame_log: bool = False,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         input=input_path,
@@ -326,6 +348,7 @@ def build_args(
         min_track_frames=min_track_frames,
         line_thickness=line_thickness,
         max_dist_px=max_dist_px,
+        full_frame_log=full_frame_log,
     )
 
 
@@ -361,9 +384,7 @@ def create_detector(model_path: Path) -> BaseDetector:
 def make_output_paths(output_dir: Path, input_video: Path) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = input_video.stem
-    annotated_video = output_dir / f"{stem}_annotated.mp4"
-    summary_json = output_dir / f"{stem}_summary.json"
-    return annotated_video, summary_json
+    return output_dir / f"{stem}_annotated.mp4", output_dir / f"{stem}_summary.json"
 
 
 def choose_writer_fps(capture: cv2.VideoCapture) -> float:
@@ -372,7 +393,6 @@ def choose_writer_fps(capture: cv2.VideoCapture) -> float:
 
 
 def color_for_track(track_id: int) -> tuple[int, int, int]:
-    # Stable color per track ID so the same bee tends to look consistent.
     return (
         (37 * track_id) % 255,
         (17 * track_id + 91) % 255,
@@ -424,7 +444,6 @@ def postprocess_detections(
     nms_iou: float,
 ) -> list[Detection]:
     # YOLOv8 ONNX output: [1, features, anchors] or [1, anchors, features].
-    # Strip the batch dimension, then ensure shape is [anchors, features].
     if output.ndim == 3:
         predictions = output[0]
     elif output.ndim == 2:
@@ -471,12 +490,7 @@ def postprocess_detections(
     detections: list[Detection] = []
     for idx in np.array(selected).flatten():
         x, y, w, h = boxes[idx]
-        detections.append(
-            Detection(
-                bbox=[x, y, x + w, y + h],
-                confidence=float(confidences[idx]),
-            )
-        )
+        detections.append(Detection(bbox=[x, y, x + w, y + h], confidence=float(confidences[idx])))
     return detections
 
 
@@ -493,30 +507,38 @@ def draw_overlay(
         f"Unique bees confirmed: {confirmed_unique_count}",
         f"Unique bee IDs seen: {provisional_unique_count}",
     ]
-    x = 15
-    y = 30
+    x, y = 15, 30
     for line in lines:
-        cv2.putText(
-            frame,
-            line,
-            (x, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 0, 0),
-            4,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            line,
-            (x, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+        cv2.putText(frame, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(frame, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
         y += 28
+
+
+def _aggregate_frame_records(
+    frame_records: list[dict[str, Any]], fps: float
+) -> list[dict[str, Any]]:
+    """Collapse per-frame records into per-second aggregates to keep JSON small."""
+    if not frame_records:
+        return []
+    fps = fps if fps > 0 else 30.0
+    by_second: dict[int, dict[str, Any]] = {}
+    for rec in frame_records:
+        sec = int(rec["frame_index"] / fps)
+        if sec not in by_second:
+            by_second[sec] = {
+                "second": sec,
+                "active_bees_peak": 0,
+                "detections_total": 0,
+                "unique_bees_confirmed": rec["unique_bees_confirmed_so_far"],
+                "unique_bee_ids_seen": rec["unique_bee_ids_seen_so_far"],
+            }
+        entry = by_second[sec]
+        entry["active_bees_peak"] = max(entry["active_bees_peak"], rec["active_bees"])
+        entry["detections_total"] += rec["detections"]
+        # Keep the latest (highest-frame) value for cumulative counters.
+        entry["unique_bees_confirmed"] = rec["unique_bees_confirmed_so_far"]
+        entry["unique_bee_ids_seen"] = rec["unique_bee_ids_seen_so_far"]
+    return list(by_second.values())
 
 
 def build_summary(
@@ -526,8 +548,10 @@ def build_summary(
     frame_records: list[dict[str, Any]],
     track_history: dict[int, TrackStats],
     confirmed_ids: set[int],
+    fps: float = 30.0,
+    full_frame_log: bool = False,
 ) -> dict[str, Any]:
-    max_active = max((record["active_bees"] for record in frame_records), default=0)
+    max_active = max((r["active_bees"] for r in frame_records), default=0)
     summary_tracks = {
         str(track_id): {
             "first_frame": stats.first_frame,
@@ -539,15 +563,24 @@ def build_summary(
         }
         for track_id, stats in sorted(track_history.items())
     }
+
+    if full_frame_log:
+        timeline_key = "frame_counts"
+        timeline = frame_records
+    else:
+        timeline_key = "second_counts"
+        timeline = _aggregate_frame_records(frame_records, fps)
+
     return {
         "input_video": str(input_video),
         "model_path": str(model_path),
         "annotated_video": str(annotated_video),
         "total_frames_processed": len(frame_records),
+        "fps": round(fps, 3),
         "max_active_bees_in_frame": max_active,
         "unique_bee_ids_seen": len(track_history),
         "unique_bees_confirmed": len(confirmed_ids),
-        "frame_counts": frame_records,
+        timeline_key: timeline,
         "tracks": summary_tracks,
     }
 
@@ -555,6 +588,7 @@ def build_summary(
 def process_video(
     args: argparse.Namespace,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[Path, Path]:
     model_path = Path(args.model).resolve()
     input_video = Path(args.input).resolve()
@@ -565,7 +599,9 @@ def process_video(
 
     annotated_video, summary_json = make_output_paths(output_dir, input_video)
 
+    logger.info("Loading detector from %s", model_path)
     detector = create_detector(model_path)
+
     capture = cv2.VideoCapture(str(input_video))
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {input_video}")
@@ -574,6 +610,12 @@ def process_video(
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = choose_writer_fps(capture)
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+
+    logger.info(
+        "Video: %dx%d @ %.2f fps, ~%s frames",
+        width, height, fps, total_frames if total_frames else "unknown",
+    )
+
     writer = cv2.VideoWriter(
         str(annotated_video),
         cv2.VideoWriter_fourcc(*"mp4v"),
@@ -595,6 +637,10 @@ def process_video(
 
     try:
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                logger.info("Processing cancelled at frame %d.", frame_index)
+                break
+
             ok, frame = capture.read()
             if not ok:
                 break
@@ -624,17 +670,10 @@ def process_video(
 
                 x1, y1, x2, y2 = bbox
                 color = color_for_track(track_id)
-                label = f"Bee ID {track_id} | {confidence:.2f}"
-                cv2.rectangle(
-                    frame,
-                    (x1, y1),
-                    (x2, y2),
-                    color,
-                    args.line_thickness,
-                )
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, args.line_thickness)
                 cv2.putText(
                     frame,
-                    label,
+                    f"Bee {track_id} | {confidence:.2f}",
                     (x1, max(20, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
@@ -670,9 +709,20 @@ def process_video(
                     }
                 )
             frame_index += 1
+
+            if frame_index % 500 == 0:
+                logger.debug(
+                    "Frame %d — active tracks: %d, confirmed IDs: %d",
+                    frame_index, len(active_ids), len(confirmed_ids),
+                )
     finally:
         capture.release()
         writer.release()
+
+    logger.info(
+        "Done. %d frames processed, %d unique bees confirmed.",
+        frame_index, len(confirmed_ids),
+    )
 
     summary = build_summary(
         input_video=input_video,
@@ -681,16 +731,19 @@ def process_video(
         frame_records=frame_records,
         track_history=track_history,
         confirmed_ids=confirmed_ids,
+        fps=fps,
+        full_frame_log=getattr(args, "full_frame_log", False),
     )
     summary_json.write_text(json.dumps(summary, indent=2))
     return annotated_video, summary_json
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
     annotated_video, summary_json = process_video(args)
-    print(f"Annotated video written to: {annotated_video}")
-    print(f"Summary written to: {summary_json}")
+    logger.info("Annotated video: %s", annotated_video)
+    logger.info("Summary: %s", summary_json)
 
 
 if __name__ == "__main__":
