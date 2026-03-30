@@ -36,6 +36,7 @@ class BeeVideoApp:
         self.max_track_age_var = tk.IntVar(value=20)
         self.min_track_frames_var = tk.IntVar(value=3)
         self.line_thickness_var = tk.IntVar(value=2)
+        self.max_dist_px_var = tk.DoubleVar(value=150.0)
         self.status_var = tk.StringVar(value="Choose a video and click Run pipeline.")
         self.progress_var = tk.StringVar(value="Idle")
 
@@ -50,6 +51,7 @@ class BeeVideoApp:
         container.grid(sticky="nsew")
         container.columnconfigure(0, weight=1)
         container.rowconfigure(3, weight=1)
+        container.rowconfigure(5, weight=1)
 
         title = ttk.Label(
             container,
@@ -84,6 +86,7 @@ class BeeVideoApp:
         self._add_spinbox(tuning, 1, 0, "Max track age", self.max_track_age_var, 1, 200, 1)
         self._add_spinbox(tuning, 1, 1, "Min track frames", self.min_track_frames_var, 1, 50, 1)
         self._add_spinbox(tuning, 1, 2, "Line thickness", self.line_thickness_var, 1, 8, 1)
+        self._add_spinbox(tuning, 1, 3, "Max dist (px)", self.max_dist_px_var, 10, 500, 10)
 
         actions = ttk.Frame(container, padding=(0, 12, 0, 0))
         actions.grid(row=4, column=0, sticky="ew")
@@ -170,16 +173,20 @@ class BeeVideoApp:
         if self.worker and self.worker.is_alive():
             return
 
-        input_path = Path(self.input_var.get().strip())
-        model_path = Path(self.model_var.get().strip())
+        input_str = self.input_var.get().strip()
+        model_str = self.model_var.get().strip()
         output_dir = Path(self.output_var.get().strip())
 
-        if not input_path:
+        if not input_str:
             messagebox.showerror("Missing input", "Choose an input video first.")
             return
-        if not model_path:
+        if not model_str:
             messagebox.showerror("Missing model", "Choose a model first.")
             return
+
+        input_path = Path(input_str)
+        model_path = Path(model_str)
+
         if model_path.suffix.lower() not in {".onnx", ".pt"}:
             messagebox.showerror("Wrong model type", "Choose a .onnx or .pt model.")
             return
@@ -197,6 +204,7 @@ class BeeVideoApp:
             max_track_age=int(self.max_track_age_var.get()),
             min_track_frames=int(self.min_track_frames_var.get()),
             line_thickness=int(self.line_thickness_var.get()),
+            max_dist_px=float(self.max_dist_px_var.get()),
         )
 
         self._set_output_text("")

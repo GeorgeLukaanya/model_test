@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 import cv2
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v"}
@@ -56,10 +57,39 @@ class Track:
         self.age = 0
 
 
+def _combined_score(bbox_a: list[int], bbox_b: list[int], iou_threshold: float, max_dist_px: float) -> float:
+    """Return a match score in (0, 1].
+
+    Returns the IoU when boxes overlap and IoU >= iou_threshold.
+    Falls back to a small proximity score when bees are nearby but not overlapping,
+    so fast-moving bees keep their track ID even between non-overlapping frames.
+    Returns 0 when neither criterion is met (no valid match).
+    """
+    iou = bbox_iou(bbox_a, bbox_b)
+    if iou >= iou_threshold:
+        return iou
+
+    cx_a = (bbox_a[0] + bbox_a[2]) / 2.0
+    cy_a = (bbox_a[1] + bbox_a[3]) / 2.0
+    cx_b = (bbox_b[0] + bbox_b[2]) / 2.0
+    cy_b = (bbox_b[1] + bbox_b[3]) / 2.0
+    dist = ((cx_a - cx_b) ** 2 + (cy_a - cy_b) ** 2) ** 0.5
+    if dist < max_dist_px:
+        # Scale to (0, 0.05] so centroid matches are always ranked below any valid IoU match.
+        return (1.0 - dist / max_dist_px) * 0.05
+    return 0.0
+
+
 class BeeTracker:
-    def __init__(self, iou_threshold: float = 0.3, max_age: int = 20) -> None:
+    def __init__(
+        self,
+        iou_threshold: float = 0.1,
+        max_age: int = 20,
+        max_dist_px: float = 150.0,
+    ) -> None:
         self.iou_threshold = iou_threshold
         self.max_age = max_age
+        self.max_dist_px = max_dist_px
         self.next_track_id = 1
         self.tracks: dict[int, Track] = {}
 
@@ -103,31 +133,34 @@ class BeeTracker:
         if not self.tracks or not detections:
             return [], list(self.tracks.keys()), list(range(len(detections)))
 
-        candidate_pairs: list[tuple[float, int, int]] = []
-        for track_id, track in self.tracks.items():
-            for det_idx, detection in enumerate(detections):
-                score = bbox_iou(track.bbox, detection.bbox)
-                if score >= self.iou_threshold:
-                    candidate_pairs.append((score, track_id, det_idx))
+        track_ids = list(self.tracks.keys())
+        n_tracks = len(track_ids)
+        n_dets = len(detections)
 
-        candidate_pairs.sort(reverse=True)
+        # Build score matrix [n_tracks × n_dets].
+        score_matrix = np.zeros((n_tracks, n_dets), dtype=np.float32)
+        for i, tid in enumerate(track_ids):
+            for j, det in enumerate(detections):
+                score_matrix[i, j] = _combined_score(
+                    self.tracks[tid].bbox, det.bbox, self.iou_threshold, self.max_dist_px
+                )
+
+        # Optimal (Hungarian) assignment minimises cost = 1 - score.
+        row_ind, col_ind = linear_sum_assignment(1.0 - score_matrix)
+
         matched_tracks: set[int] = set()
         matched_detections: set[int] = set()
         matches: list[tuple[int, int]] = []
 
-        for _, track_id, det_idx in candidate_pairs:
-            if track_id in matched_tracks or det_idx in matched_detections:
-                continue
-            matched_tracks.add(track_id)
-            matched_detections.add(det_idx)
-            matches.append((track_id, det_idx))
+        for r, c in zip(row_ind.tolist(), col_ind.tolist()):
+            if score_matrix[r, c] > 0.0:
+                tid = track_ids[r]
+                matched_tracks.add(tid)
+                matched_detections.add(c)
+                matches.append((tid, c))
 
-        unmatched_tracks = [
-            track_id for track_id in self.tracks if track_id not in matched_tracks
-        ]
-        unmatched_detections = [
-            det_idx for det_idx in range(len(detections)) if det_idx not in matched_detections
-        ]
+        unmatched_tracks = [tid for tid in track_ids if tid not in matched_tracks]
+        unmatched_detections = [j for j in range(n_dets) if j not in matched_detections]
         return matches, unmatched_tracks, unmatched_detections
 
 
@@ -256,6 +289,15 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Bounding box line thickness for annotations.",
     )
+    parser.add_argument(
+        "--max-dist-px",
+        type=float,
+        default=150.0,
+        help=(
+            "Maximum centroid-to-centroid distance (pixels) for falling back to "
+            "distance-based matching when IoU is zero. Helps track fast-moving bees."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -266,10 +308,11 @@ def build_args(
     conf: float = 0.25,
     nms_iou: float = 0.45,
     imgsz: int = 640,
-    track_iou: float = 0.3,
+    track_iou: float = 0.1,
     max_track_age: int = 20,
     min_track_frames: int = 3,
     line_thickness: int = 2,
+    max_dist_px: float = 150.0,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         input=input_path,
@@ -282,6 +325,7 @@ def build_args(
         max_track_age=max_track_age,
         min_track_frames=min_track_frames,
         line_thickness=line_thickness,
+        max_dist_px=max_dist_px,
     )
 
 
@@ -379,9 +423,18 @@ def postprocess_detections(
     conf_threshold: float,
     nms_iou: float,
 ) -> list[Detection]:
-    predictions = output[0]
+    # YOLOv8 ONNX output: [1, features, anchors] or [1, anchors, features].
+    # Strip the batch dimension, then ensure shape is [anchors, features].
+    if output.ndim == 3:
+        predictions = output[0]
+    elif output.ndim == 2:
+        predictions = output
+    else:
+        raise ValueError(f"Unexpected ONNX output shape: {output.shape}")
+    if predictions.ndim != 2:
+        raise ValueError(f"Unexpected predictions shape after batch strip: {predictions.shape}")
     if predictions.shape[0] < predictions.shape[1]:
-        predictions = predictions.transpose(1, 0)
+        predictions = predictions.T
 
     frame_h, frame_w = frame_shape
     boxes: list[list[int]] = []
@@ -534,7 +587,11 @@ def process_video(
     frame_records: list[dict[str, Any]] = []
     track_history: dict[int, TrackStats] = {}
     confirmed_ids: set[int] = set()
-    tracker = BeeTracker(iou_threshold=args.track_iou, max_age=args.max_track_age)
+    tracker = BeeTracker(
+        iou_threshold=args.track_iou,
+        max_age=args.max_track_age,
+        max_dist_px=args.max_dist_px,
+    )
 
     try:
         while True:
